@@ -5,6 +5,8 @@ author: Max Gordy
 date: "2025-03-12 (update 03-19)"
 ---
 
+hi yoshi 
+
 ```{r setup, include=FALSE}
 library(tidycensus)
 library(tidyverse)
