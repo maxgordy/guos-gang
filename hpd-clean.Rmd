@@ -1,0 +1,361 @@
+---
+title: "HPD.explore"
+output: html_document
+author: Max Gordy
+date: "2025-03-12 (update 03-19)"
+---
+
+```{r setup, include=FALSE}
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(ggplot2)
+library(janitor)
+library(readxl)
+library(gt)
+library(ggpattern)
+library(leaflet)
+library(mapview)
+library(dplyr)
+library(leafpop)
+```
+
+# HPD Affordable Housing Production Data
+
+HPD reports on projects, buildings, and units that began after January 1, 2014, and are counted towards either the Housing New York plan (1/1/2014 – 12/31/2021) or the Housing Our Neighbors: A Blueprint for Housing & Homelessness plan (1/1/2022 – present).
+Complete info on data is available [here](https://data.cityofnewyork.us/Housing-Development/Affordable-Housing-Production-by-Project/hq68-rnsi/about_data).
+
+### General Notes
+
+- Available by project and by building \ 
+  - building has bbls \
+  - project has program info \
+  - I'm joining project info to individual buildings \
+- 8,108 building entries
+  1604 marked confidential - no location data
+- 3037 entries that overlap with our filtered DCP dataset \
+	- 2147 unique overlapping projects \
+		- ex: [New Penn Development](https://architizer.com/projects/new-penn-development/) is a complex of 10 affordable housing buildings, so it has 10 entries in this dataset. \
+- Filtering by new construction only \ 
+  - (3,946/8,108)
+    - 970/3,946 are marked confidential
+
+## Data
+
+```{r, include=FALSE}
+# load in data
+
+hpd_projs <- read_csv("data/hpd/Affordable_Housing_Production_by_Project_20250312.csv") %>% clean_names()
+
+head(hpd_projs)
+
+
+hpd_bldgs <- read_csv("data/hpd/Affordable_Housing_Production_by_Building_20250312.csv") %>% 
+  clean_names() %>% 
+  mutate(bbl = as.character(bbl)) %>% 
+  filter(
+    reporting_construction_type == "New Construction"
+  )
+
+head(hpd_bldgs)
+
+```
+
+```{r NA counts, echo=FALSE}
+print("Column Names:")
+colnames(hpd_bldgs)
+
+print("Total Entries:")
+length(hpd_bldgs$`project_name`)
+
+print("Entries Marked Confidential:")
+sum(hpd_bldgs$`project_name` == "CONFIDENTIAL")
+
+```
+
+
+## Mapping
+
+You can click on points to bring up bbl and project name. 
+
+```{r echo=FALSE}
+# mapping
+hpd_sf <- hpd_bldgs %>%
+  filter(!is.na(longitude) & !is.na(latitude)) %>%
+  mutate(unit_type = case_when(
+    !is.na(counted_homeownership_units) & counted_homeownership_units > 0 & is.na(counted_rental_units) ~ "Homeownership",
+    !is.na(counted_rental_units) & counted_rental_units > 0 & is.na(counted_homeownership_units) ~ "Rental",
+    TRUE ~ "Mixed"
+  )) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# Create popup table with project name and BBL
+hpd_sf$popup_info <- data.frame(
+  "Project Name" = hpd_sf$project_name,
+  "BBL" = hpd_sf$bbl,
+  "Total Units" = hpd_sf$all_counted_units
+)
+
+# Create interactive map with size = total units, color = unit type, and popups showing project name and BBL
+mapview(hpd_sf, 
+        zcol = "unit_type", 
+        cex = "all_counted_units", 
+        col.regions = c("blue", "purple", "red"),
+        popup = popupTable(hpd_sf, zcol = c("project_name", "bbl", "all_counted_units")))
+
+```
+
+
+## Program Analysis
+
+It seems like the number of confidential program groups and NA tax benefits makes this dataset not very useful for program analysis.
+
+```{r include=FALSE}
+
+# Get the column names of both data frames
+cols_bldgs <- colnames(hpd_bldgs)
+cols_projs <- colnames(hpd_projs)
+
+# Find columns in df1 that are not in df2
+unique_cols_in_projs <- setdiff(cols_projs, cols_bldgs)
+
+# Print the result
+print(paste("Variables in Projects but not Buildings:", paste(unique_cols_in_projs, collapse = ", ")))
+
+# Select only the unique columns in projs
+projs_unique <- hpd_projs %>% select(project_id, program_group, planned_tax_benefit, senior_units)
+
+# Join projs to buildings on a common key (e.g., project_id or bbl)
+joined_data <- hpd_bldgs %>%
+  left_join(projs_unique, by = "project_id")  # Replace 'project_id' with your actual key
+
+```
+
+### Units by Program Group
+Removed Confidential Entries (3,823,936/4,097,311)
+
+```{r, echo=FALSE}
+
+program_group_summary <- joined_data %>%
+  mutate(program_group = ifelse(is.na(program_group), "NA", program_group)) %>%
+  group_by(program_group) %>%
+  summarise(
+    count = n(),
+    total_units = sum(all_counted_units, na.rm = TRUE)
+  ) %>%
+  arrange(desc(count))
+
+# Print the table
+print(program_group_summary)
+
+# Create the pie chart
+ggplot(program_group_summary, aes(x = "", y = count, fill = program_group)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar(theta = "y") +
+  theme_void() +  # Removes background grid and axes
+  labs(fill = "Program Group", title = "Distribution of Program Group Designations") +
+  theme(legend.position = "right")
+
+
+
+
+
+# Summarize rental and homeownership units by program group
+summary_data <- joined_data %>%
+  filter(program_group != "CONFIDENTIAL") %>%  # Exclude confidential program groups if needed
+  group_by(program_group) %>%  # Group by program group
+  summarise(
+    rental_units = sum(counted_rental_units, na.rm = TRUE),
+    homeownership_units = sum(counted_homeownership_units, na.rm = TRUE),
+    total_units = sum(all_counted_units, na.rm = TRUE)  # Add total units for sorting
+  )
+
+# Reshape data to long format for easier plotting
+summary_data_long <- summary_data %>%
+  pivot_longer(cols = c(rental_units, homeownership_units),  # Exclude 'total_units'
+               names_to = "unit_type", values_to = "unit_count") %>%
+  # Reorder 'program_group' based on total 'unit_count'
+  mutate(program_group = reorder(program_group, unit_count, sum))
+
+# Plot the data with stacked rental and homeownership units
+ggplot(summary_data_long, aes(x = program_group, y = unit_count, fill = unit_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(
+    title = "Rental and Homeownership Units by Program Group",
+    x = "Program Group",
+    y = "Number of Units",
+    fill = "Unit Type"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)  # Slant x-axis labels
+  )
+
+```
+
+
+### Units by Tax Benefit
+NAs removed (2,570,097 NAs out of 2,579,320)
+```{r, echo=FALSE}
+
+tax_benefit_summary <- joined_data %>%
+  mutate(planned_tax_benefit = ifelse(is.na(planned_tax_benefit), "NA", planned_tax_benefit)) %>%
+  group_by(planned_tax_benefit) %>%
+  summarise(
+    count = n(),
+    total_units = sum(all_counted_units, na.rm = TRUE)
+  ) %>%
+  arrange(desc(count))
+
+# Print the table
+print(tax_benefit_summary)
+
+# Create the pie chart
+ggplot(tax_benefit_summary, aes(x = "", y = count, fill = planned_tax_benefit)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar(theta = "y") +
+  theme_void() +  # Removes background grid and axes
+  labs(fill = "Planned Tax Benefit", title = "Distribution of Planned Tax Benefit Designations") +
+  theme(legend.position = "right")
+
+# Summarize rental and homeownership units by program, excluding NAs
+summary_data <- joined_data %>%
+  filter(!is.na(planned_tax_benefit)) %>%  # Exclude rows where 'planned_tax_benefit' is NA
+  group_by(planned_tax_benefit) %>%
+  summarise(
+    rental_units = sum(counted_rental_units, na.rm = TRUE),
+    homeownership_units = sum(counted_homeownership_units, na.rm = TRUE),
+    total_units = rental_units + homeownership_units  # Calculate total units
+  )
+
+# Reorder 'planned_tax_benefit' based on total_units in descending order
+summary_data <- summary_data %>%
+  mutate(planned_tax_benefit = reorder(planned_tax_benefit, total_units, sum))
+
+# Reshape data to long format for easier plotting
+summary_data_long <- summary_data %>%
+  pivot_longer(cols = c(rental_units, homeownership_units), 
+               names_to = "unit_type", values_to = "unit_count")
+
+# Plot the data with stacked rental and homeownership units
+ggplot(summary_data_long, aes(x = planned_tax_benefit, y = unit_count, fill = unit_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(
+    title = "Rental and Homeownership Units by Tax Benefit",
+    x = "Planned Tax Benefit",
+    y = "Number of Units",
+    fill = "Unit Type"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)  # Slant x-axis labels
+  )
+
+
+```
+
+
+### Units by Project 
+
+Confidential Removed, vast majority of units (3,823,936/4,097,311)
+```{r, echo=FALSE}
+
+project_name_summary <- joined_data %>%
+  mutate(project_name = ifelse(is.na(project_name), "NA", project_name)) %>%
+  group_by(project_name) %>%
+  summarise(
+    count = n(),
+    total_units = sum(all_counted_units, na.rm = TRUE)
+  ) %>%
+  arrange(desc(count))
+
+# Print the table
+print(project_name_summary)
+
+
+# Summarize rental and homeownership units by program
+summary_data <- joined_data %>%
+  filter(project_name != "CONFIDENTIAL") %>%  # Exclude "CONFIDENTIAL" projects
+  group_by(project_name) %>%  # Group by project name
+  summarise(
+    rental_units = sum(counted_rental_units, na.rm = TRUE),
+    homeownership_units = sum(counted_homeownership_units, na.rm = TRUE),
+    total_units = sum(all_counted_units, na.rm = TRUE)
+  )
+
+# Reshape data to long format for easier plotting, excluding 'total_units'
+summary_data_long <- summary_data %>%
+  top_n(10, total_units) %>%  # Select top 10 programs based on total units
+  pivot_longer(cols = c(rental_units, homeownership_units),  # Exclude total_units
+               names_to = "unit_type", values_to = "unit_count") %>%
+  # Reorder 'project_name' based on total 'unit_count'
+  mutate(project_name = reorder(project_name, unit_count, sum))
+
+# Plot the data with stacked rental and homeownership units
+ggplot(summary_data_long, aes(x = project_name, y = unit_count, fill = unit_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(
+    title = "Rental and Homeownership Units by Project",
+    x = "Project Name",
+    y = "Number of Units",
+    fill = "Unit Type"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)  # Slant x-axis labels
+  )
+
+```
+
+# Analyze by PUMA
+
+# pull data
+```{r}
+# Load 2020 PUMA shapefile
+nyc_pumas <- st_read("data/nyc_mappluto_24v4_fgdb/nypuma2020_25a/nypuma2020.shp") %>%
+  st_transform(crs = st_crs(hpd_sf))  # Match CRS with hpd_sf
+```
+
+### Spatial Join and Summarize
+```{r}
+# Only use geocoded HPD buildings
+hpd_with_puma <- hpd_sf %>%
+  filter(!is.na(all_counted_units)) %>%
+  st_join(nyc_pumas, join = st_within)  # Join buildings to PUMAs
+
+hpd_puma_summary <- hpd_with_puma %>%
+  st_drop_geometry() %>%  # Drop geometry to enable summarization
+  group_by(PUMA) %>%  # Adjust this to match actual column name in your shapefile, maybe `puma` or `puma_code`
+  summarise(total_units = sum(all_counted_units, na.rm = TRUE)) %>%
+  arrange(desc(total_units))
+
+```
+
+#### join back and map
+```{r}
+puma_with_hpd <- nyc_pumas %>%
+  left_join(hpd_puma_summary, by = "PUMA")  # Adjust field name if needed
+
+# Quick choropleth map
+ggplot(puma_with_hpd) +
+  geom_sf(aes(fill = total_units)) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80") +
+  theme_minimal() +
+  labs(
+    title = "Affordable Housing Units (New Construction) by PUMA",
+    fill = "Total Units"
+  )
+
+leaflet(puma_with_hpd) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~colorNumeric("YlOrRd", domain = total_units)(total_units),
+    weight = 1,
+    color = "#333",
+    fillOpacity = 0.7,
+    popup = ~paste("PUMA:", PUMA, "<br>Total Units:", total_units)
+  )
+
+```
+
+
